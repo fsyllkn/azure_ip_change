@@ -6,6 +6,7 @@
 #   - 可通过 PyInstaller 打包成独立的 .exe 文件。
 #   - 从配置文件读取并让用户选择多个 Azure 账号。
 #   - 自动完成 IP 的解绑、创建、绑定和清理。
+#   - [新功能] 支持循环操作，按 ESC 退出，按任意键继续。
 #
 # 运行前请先安装依赖库:
 # pip install azure-identity azure-mgmt-resource azure-mgmt-compute azure-mgmt-network
@@ -42,7 +43,7 @@ def select_from_list(items, prompt, display_key=None):
 
     print(f"\n请从以下 {prompt} 中选择一个:")
     for i, item in enumerate(items, 1):
-        display_text = item[display_key] if display_key else item
+        display_text = item[display_key] if display_key and isinstance(item, dict) else item
         print(f"  {i}) {display_text}")
 
     try:
@@ -60,158 +61,183 @@ def select_from_list(items, prompt, display_key=None):
 
 
 def main():
-    """主执行函数"""
-    # 1. 读取和选择 Azure 凭据
-    config = configparser.ConfigParser()
-    
-    effective_config_path = ""
-    # 优先使用容器内的路径
-    if os.path.exists(CONFIG_FILE_PATH):
-        effective_config_path = CONFIG_FILE_PATH
-    # 否则使用本地路径
-    elif os.path.exists(LOCAL_CONFIG_FILE_PATH):
-        effective_config_path = LOCAL_CONFIG_FILE_PATH
-    else:
-        print(f"错误: 在脚本目录或 /config/ 中未找到配置文件 'my_azure_creds.conf'。")
-        sys.exit(1)
-
-    print(f"找到配置文件: {effective_config_path}，正在加载...")
-    config.read(effective_config_path, encoding='utf-8')
-
-    accounts = []
-    for section in config.sections():
-        if section.startswith('ACCOUNT_'):
-            account_details = dict(config[section])
-            account_details['section_name'] = section
-            accounts.append(account_details)
-
-    if not accounts:
-        print("错误: 在配置文件中没有找到任何有效格式的账号 (例如 [ACCOUNT_1])。")
-        sys.exit(1)
-    
-    # 创建用于显示的选择列表
-    account_display_list = [
-        {'display': acc.get('az_account_name', f"订阅ID: {acc.get('az_subscription_id')}"), 'data': acc}
-        for acc in accounts
-    ]
-
-    selected_account_display = select_from_list(account_display_list, "Azure 账号", display_key='display')
-    creds = selected_account_display['data']
-    
-    app_id = creds['az_app_id']
-    tenant_id = creds['az_tenant_id']
-    password = creds['az_password']
-    subscription_id = creds['az_subscription_id']
-    
-    print(f"已选择账号: {selected_account_display['display']}")
-
-    # 2. 使用 SDK 进行认证并创建客户端
-    try:
-        print("\n正在使用服务主体登录 Azure...")
-        credential = ClientSecretCredential(tenant_id=tenant_id, client_id=app_id, client_secret=password)
+    """主执行函数，包含一个主循环以支持连续操作。"""
+    while True:
+        # 1. 读取和选择 Azure 凭据
+        config = configparser.ConfigParser()
         
-        resource_client = ResourceManagementClient(credential, subscription_id)
-        compute_client = ComputeManagementClient(credential, subscription_id)
-        network_client = NetworkManagementClient(credential, subscription_id)
-        print("登录成功。")
-    except Exception as e:
-        print(f"登录失败，请检查所选账号的凭据是否正确。错误: {e}")
-        sys.exit(1)
+        effective_config_path = ""
+        if os.path.exists(CONFIG_FILE_PATH):
+            effective_config_path = CONFIG_FILE_PATH
+        elif os.path.exists(LOCAL_CONFIG_FILE_PATH):
+            effective_config_path = LOCAL_CONFIG_FILE_PATH
+        else:
+            print(f"错误: 在脚本目录或 /config/ 中未找到配置文件 'my_azure_creds.conf'。")
+            sys.exit(1)
 
-    # 3. 选择资源组
-    resource_groups_pager = resource_client.resource_groups.list()
-    resource_groups = [rg.name for rg in resource_groups_pager]
-    resource_group_name = select_from_list(resource_groups, "资源组")
-    print(f"已选择资源组: {resource_group_name}")
+        print(f"找到配置文件: {effective_config_path}，正在加载...")
+        config.read(effective_config_path, encoding='utf-8')
 
-    # 4. 选择虚拟机
-    vms_pager = compute_client.virtual_machines.list(resource_group_name)
-    vms = [vm.name for vm in vms_pager]
-    vm_name = select_from_list(vms, "虚拟机")
-    print(f"已选择虚拟机: {vm_name}")
-    
-    timestamp = int(time.time())
-    new_public_ip_name = f"{vm_name}-ip-{timestamp}"
+        accounts = []
+        for section in config.sections():
+            if section.startswith('ACCOUNT_'):
+                account_details = dict(config[section])
+                account_details['section_name'] = section
+                accounts.append(account_details)
 
-    # 5. 获取 NIC 信息
-    print("\n正在获取虚拟机网络接口信息...")
-    vm = compute_client.virtual_machines.get(resource_group_name, vm_name)
-    nic_id = vm.network_profile.network_interfaces[0].id
-    nic_name = nic_id.split('/')[-1]
-    print(f"已找到网络接口名称: {nic_name}")
-
-    nic = network_client.network_interfaces.get(resource_group_name, nic_name)
-    nic_location = nic.location
-    ip_config = nic.ip_configurations[0]
-    ip_config_name = ip_config.name
-    print(f"已找到网络接口位置: {nic_location}")
-    print(f"已找到 IP 配置名称: {ip_config_name}")
-
-    # 6. 解除旧 IP 关联
-    print("\n正在获取旧的公共IP名称并解除关联...")
-    if ip_config.public_ip_address:
-        old_public_ip_id = ip_config.public_ip_address.id
-        old_public_ip_name = old_public_ip_id.split('/')[-1]
-        print(f"找到旧的公共IP: {old_public_ip_name}")
+        if not accounts:
+            print("错误: 在配置文件中没有找到任何有效格式的账号 (例如 [ACCOUNT_1])。")
+            sys.exit(1)
         
-        ip_config.public_ip_address = None
+        account_display_list = [
+            {'display': acc.get('az_account_name', f"订阅ID: {acc.get('az_subscription_id')}"), 'data': acc}
+            for acc in accounts
+        ]
+
+        selected_account_display = select_from_list(account_display_list, "Azure 账号", display_key='display')
+        creds = selected_account_display['data']
+        
+        app_id = creds['az_app_id']
+        tenant_id = creds['az_tenant_id']
+        password = creds['az_password']
+        subscription_id = creds['az_subscription_id']
+        
+        print(f"已选择账号: {selected_account_display['display']}")
+
+        # 2. 使用 SDK 进行认证并创建客户端
+        try:
+            print("\n正在使用服务主体登录 Azure...")
+            credential = ClientSecretCredential(tenant_id=tenant_id, client_id=app_id, client_secret=password)
+            
+            resource_client = ResourceManagementClient(credential, subscription_id)
+            compute_client = ComputeManagementClient(credential, subscription_id)
+            network_client = NetworkManagementClient(credential, subscription_id)
+            print("登录成功。")
+        except Exception as e:
+            print(f"登录失败，请检查所选账号的凭据是否正确。错误: {e}")
+            sys.exit(1)
+
+        # 3. 选择资源组
+        resource_groups_pager = resource_client.resource_groups.list()
+        resource_groups = [rg.name for rg in resource_groups_pager]
+        resource_group_name = select_from_list(resource_groups, "资源组")
+        print(f"已选择资源组: {resource_group_name}")
+
+        # 4. 选择虚拟机
+        vms_pager = compute_client.virtual_machines.list(resource_group_name)
+        vms = [vm.name for vm in vms_pager]
+        vm_name = select_from_list(vms, "虚拟机")
+        print(f"已选择虚拟机: {vm_name}")
+        
+        timestamp = int(time.time())
+        new_public_ip_name = f"{vm_name}-ip-{timestamp}"
+
+        # 5. 获取 NIC 信息
+        print("\n正在获取虚拟机网络接口信息...")
+        vm = compute_client.virtual_machines.get(resource_group_name, vm_name)
+        nic_id = vm.network_profile.network_interfaces[0].id
+        nic_name = nic_id.split('/')[-1]
+        print(f"已找到网络接口名称: {nic_name}")
+
+        nic = network_client.network_interfaces.get(resource_group_name, nic_name)
+        nic_location = nic.location
+        ip_config = nic.ip_configurations[0]
+        ip_config_name = ip_config.name
+        print(f"已找到网络接口位置: {nic_location}")
+        print(f"已找到 IP 配置名称: {ip_config_name}")
+
+        # 6. 解除旧 IP 关联
+        print("\n正在获取旧的公共IP名称并解除关联...")
+        if ip_config.public_ip_address:
+            old_public_ip_id = ip_config.public_ip_address.id
+            old_public_ip_name = old_public_ip_id.split('/')[-1]
+            
+            # [修复] 获取并显示旧IP的地址
+            old_ip_address = "未知"
+            try:
+                old_ip_object = network_client.public_ip_addresses.get(resource_group_name, old_public_ip_name)
+                if old_ip_object and old_ip_object.ip_address:
+                    old_ip_address = old_ip_object.ip_address
+            except HttpResponseError:
+                print(f"警告: 无法获取IP对象 '{old_public_ip_name}' 的详细信息。")
+
+            print(f"找到旧的公共IP名称: {old_public_ip_name}")
+            print(f"找到旧的公共IP地址: {old_ip_address}")
+            
+            ip_config.public_ip_address = None
+            
+            poller = network_client.network_interfaces.begin_create_or_update(resource_group_name, nic_name, nic)
+            poller.result() # 等待操作完成
+            print(f"已成功解除旧公共IP {old_ip_address} 的关联。")
+        else:
+            print("警告：虚拟机没有关联公共IP，将直接创建新IP。")
+
+        # 7. 创建新 IP
+        print(f"\n正在创建新的公共IP: {new_public_ip_name}...")
+        ip_params = {
+            "location": nic_location,
+            "sku": {"name": "Standard"},
+            "public_ip_allocation_method": "Static"
+        }
+        poller = network_client.public_ip_addresses.begin_create_or_update(resource_group_name, new_public_ip_name, ip_params)
+        new_ip_object = poller.result()
+        print("新公共IP创建成功。")
+
+        # 8. 关联新 IP
+        print("\n正在将新的公共IP关联到网络接口...")
+        nic = network_client.network_interfaces.get(resource_group_name, nic_name)
+        nic.ip_configurations[0].public_ip_address = new_ip_object
         
         poller = network_client.network_interfaces.begin_create_or_update(resource_group_name, nic_name, nic)
-        poller.result() # 等待操作完成
-        print(f"已成功解除旧公共IP: {old_public_ip_name} 的关联。")
-    else:
-        print("警告：虚拟机没有关联公共IP，将直接创建新IP。")
+        updated_nic = poller.result()
+        
+        new_ip_address = network_client.public_ip_addresses.get(resource_group_name, new_public_ip_name).ip_address
+        
+        print("\n==========================================")
+        print("IP地址更新完成！")
+        print(f"新的公共IP名称: {new_public_ip_name}")
+        print(f"新的公共IP地址: {new_ip_address}")
+        print("==========================================")
 
-    # 7. 创建新 IP
-    print(f"\n正在创建新的公共IP: {new_public_ip_name}...")
-    ip_params = {
-        "location": nic_location,
-        "sku": {"name": "Standard"},
-        "public_ip_allocation_method": "Static"
-    }
-    poller = network_client.public_ip_addresses.begin_create_or_update(resource_group_name, new_public_ip_name, ip_params)
-    new_ip_object = poller.result()
-    print("新公共IP创建成功。")
+        # 9. 清理未关联的 IP
+        print("\n正在查找并清理资源组中所有未关联的公共IP...")
+        public_ips_pager = network_client.public_ip_addresses.list(resource_group_name)
+        unused_ips = [ip for ip in public_ips_pager if ip.ip_configuration is None]
 
-    # 8. 关联新 IP
-    print("\n正在将新的公共IP关联到网络接口...")
-    # 重新获取最新的 NIC 对象
-    nic = network_client.network_interfaces.get(resource_group_name, nic_name)
-    nic.ip_configurations[0].public_ip_address = new_ip_object
-    
-    poller = network_client.network_interfaces.begin_create_or_update(resource_group_name, nic_name, nic)
-    updated_nic = poller.result()
-    
-    new_ip_address = network_client.public_ip_addresses.get(resource_group_name, new_public_ip_name).ip_address
-    
-    print("\n==========================================")
-    print("IP地址更新完成！")
-    print(f"新的公共IP名称: {new_public_ip_name}")
-    print(f"新的公共IP地址: {new_ip_address}")
-    print("==========================================")
-
-    # 9. 清理未关联的 IP
-    print("\n正在查找并清理资源组中所有未关联的公共IP...")
-    public_ips_pager = network_client.public_ip_addresses.list(resource_group_name)
-    unused_ips = [ip for ip in public_ips_pager if ip.ip_configuration is None]
-
-    if not unused_ips:
-        print("没有发现未关联的公共IP。")
-    else:
-        print("发现以下未关联的公共IP，将进行删除：")
-        for ip in unused_ips:
-            print(f" - {ip.name}")
+        if not unused_ips:
+            print("没有发现未关联的公共IP。")
+        else:
+            print("发现以下未关联的公共IP，将进行删除：")
+            for ip in unused_ips:
+                print(f" - {ip.name}")
+                try:
+                    poller = network_client.public_ip_addresses.begin_delete(resource_group_name, ip.name)
+                    poller.result()
+                    print(f"已成功删除 {ip.name}。")
+                except HttpResponseError as e:
+                    print(f"警告：删除公共IP '{ip.name}' 失败: {e.message}")
+                    
+        print("\n==========================================")
+        print("所有操作完成！")
+        print("==========================================")
+        
+        if os.name == 'nt':
             try:
-                poller = network_client.public_ip_addresses.begin_delete(resource_group_name, ip.name)
-                poller.result()
-                print(f"已成功删除 {ip.name}。")
-            except HttpResponseError as e:
-                print(f"警告：删除公共IP '{ip.name}' 失败: {e.message}")
-            
-    print("\n==========================================")
-    print("所有操作完成！")
-    print("==========================================")
-    os.system("pause") if os.name == 'nt' else input("按 Enter 键退出...")
+                import msvcrt
+                print("\n按 ESC 键退出，或按其他任意键返回主菜单...")
+                key = msvcrt.getch()
+                if ord(key) == 27:
+                    break
+            except ImportError:
+                continue_choice = input("\n按 Enter 键返回主菜单，或输入 'exit' 退出: ")
+                if continue_choice.strip().lower() == 'exit':
+                    break
+        else:
+            continue_choice = input("\n按 Enter 键返回主菜单，或输入 'exit' 退出: ")
+            if continue_choice.strip().lower() == 'exit':
+                break
+
+        os.system('cls' if os.name == 'nt' else 'clear')
 
 
 if __name__ == "__main__":
